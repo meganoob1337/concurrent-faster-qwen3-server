@@ -194,15 +194,14 @@ fn resolve_voice(
     }
 }
 
-/// Split long text into sentences for voice clone (model truncates >25 words).
-/// Only splits when voice_id is present and text exceeds threshold.
+/// Split on `.?!` so a paragraph longer than one streaming budget can finish.
+/// Commas and colons stay in the sentence. A clause is not a new generation.
 fn split_sentences(text: &str) -> Vec<String> {
     let mut sentences = Vec::new();
-    // Split at sentence-ending punctuation
     let mut current = String::new();
     for ch in text.chars() {
         current.push(ch);
-        if matches!(ch, '.' | '!' | '?' | ';' | ':') {
+        if matches!(ch, '.' | '!' | '?') {
             let trimmed = current.trim().to_string();
             if !trimmed.is_empty() {
                 sentences.push(trimmed);
@@ -214,29 +213,8 @@ fn split_sentences(text: &str) -> Vec<String> {
     if !trimmed.is_empty() {
         sentences.push(trimmed);
     }
-    // Further split long sentences at commas
-    let mut result = Vec::new();
-    for s in sentences {
-        if s.split_whitespace().count() > 20 {
-            let mut part = String::new();
-            for ch in s.chars() {
-                part.push(ch);
-                if ch == ',' && part.split_whitespace().count() >= 8 {
-                    let t = part.trim().to_string();
-                    if !t.is_empty() { result.push(t); }
-                    part.clear();
-                }
-            }
-            let t = part.trim().to_string();
-            if !t.is_empty() { result.push(t); }
-        } else {
-            result.push(s);
-        }
-    }
-    result
+    sentences
 }
-
-const SPLIT_WORD_THRESHOLD: usize = 20;
 
 #[derive(Serialize)]
 struct HealthResponse { status: &'static str, queue_depth: usize, max_batch: usize }
@@ -441,16 +419,15 @@ async fn synthesize(State(state): State<Arc<AppState>>, Json(req): Json<SpeechRe
         return (status, Json(ErrorResponse { error: msg })).into_response();
     }
 
-    // One streaming generation stops at the first quiet gap and is capped at
-    // ~10s, so a paragraph otherwise ends after the first sentence. Split
-    // long CustomVoice and voice-clone requests into sentences.
-    let needs_split = (is_custom_voice(&state.model) || req.voice_id.is_some())
-        && req.text.split_whitespace().count() > SPLIT_WORD_THRESHOLD;
-
     if req.stream.unwrap_or(false) {
         state.metrics.requests_streaming.fetch_add(1, Ordering::Relaxed);
-        if needs_split {
-            return synthesize_streaming_split(state, req).await;
+        // One generation is capped at STREAM_MAX_FRAMES. Split a paragraph on
+        // sentence boundaries so each piece can finish. A normal sentence stays whole.
+        if state.model.exceeds_stream_frame_budget(&req.text).unwrap_or(false) {
+            let sentences = split_sentences(&req.text);
+            if sentences.len() > 1 {
+                return synthesize_streaming_split(state, req).await;
+            }
         }
         return synthesize_streaming(state, req).await;
     }
@@ -761,7 +738,6 @@ fn start_streaming_worker(model: Arc<qwen3_tts::Qwen3TTS>, cache: batch::PromptC
                 .map(|r| (r.text.clone(), r.language,
                     Some(qwen3_tts::SynthesisOptions {
                         temperature: r.temperature,
-                        max_length: batch::adaptive_max_length_streaming(&r.text),
                         ..Default::default()
                     })
                 )).collect();
@@ -787,7 +763,6 @@ fn start_streaming_worker(model: Arc<qwen3_tts::Qwen3TTS>, cache: batch::PromptC
                     std::thread::spawn(move || {
                         let mut remaining_skip = skip;
                         let mut header_sent = false;
-                        let mut speech_chunks: usize = 0;
                         while let Ok(audio) = rx.recv() {
                             let samples = &audio.samples;
                             // Skip ref_audio portion for ICL
@@ -799,17 +774,12 @@ fn start_streaming_worker(model: Arc<qwen3_tts::Qwen3TTS>, cache: batch::PromptC
                                 let trimmed = &samples[remaining_skip..];
                                 remaining_skip = 0;
                                 if !header_sent {
-                                    if tx.blocking_send(Ok(wav_header(24000, 0xFFFFFFFF))).is_err() { break; }
+                                    if tx.blocking_send(Ok(wav_header(24000, 0xFFFFFFFF))).is_err() { stop_flag.store(true, std::sync::atomic::Ordering::Relaxed); break; }
                                     header_sent = true;
                                 }
                                 if tx.blocking_send(Ok(samples_to_pcm16(trimmed))).is_err() { stop_flag.store(true, std::sync::atomic::Ordering::Relaxed); break; }
                                 continue;
                             }
-                            // Stop sending on silence (model past EOS)
-                            let rms: f32 = (samples.iter().map(|s| s*s).sum::<f32>() / samples.len().max(1) as f32).sqrt();
-                            // Stop on silence only after speech has started
-                            if speech_chunks > 2 && rms < 0.003 { stop_flag.store(true, std::sync::atomic::Ordering::Relaxed); break; }
-                            if rms > 0.01 { speech_chunks += 1; }
                             if !header_sent {
                                 if tx.blocking_send(Ok(wav_header(24000, 0xFFFFFFFF))).is_err() { stop_flag.store(true, std::sync::atomic::Ordering::Relaxed); break; }
                                 header_sent = true;
@@ -1134,6 +1104,18 @@ mod tests {
             assert_eq!(parsed, *language);
         }
         assert!("not-a-voice".parse::<Speaker>().is_err());
+    }
+
+    #[test]
+    fn test_split_sentences_keeps_clauses() {
+        let parts = split_sentences("Hello, world. How are you? Fine!");
+        assert_eq!(parts, vec!["Hello, world.", "How are you?", "Fine!"]);
+    }
+
+    #[test]
+    fn test_split_sentences_ignores_colon_and_comma() {
+        let parts = split_sentences("Wait: one, two, three things happen here");
+        assert_eq!(parts, vec!["Wait: one, two, three things happen here"]);
     }
 
     #[test]

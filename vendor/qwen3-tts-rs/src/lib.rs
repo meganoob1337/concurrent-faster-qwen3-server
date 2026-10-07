@@ -1273,6 +1273,12 @@ impl Qwen3TTS {
         &self.device
     }
 
+    /// Whether one streaming generation of `text` would be clamped to [`STREAM_MAX_FRAMES`].
+    pub fn exceeds_stream_frame_budget(&self, text: &str) -> Result<bool> {
+        let ids = self.text_tokenizer.encode(text)?;
+        Ok(text_exceeds_stream_frame_budget(ids.len()))
+    }
+
     /// Batched synthesis: process N sequences through a single forward pass per frame.
     ///
     /// Prefills are padded to the same length, then the autoregressive loop
@@ -1679,12 +1685,10 @@ impl Qwen3TTS {
         let n = requests.len();
         let reqs: Vec<(String, Language, Option<SynthesisOptions>)> = requests.to_vec();
 
-        // Use per-request options or defaults
+        // Sampling settings come from the first request. Frame budgets do not:
+        // each sequence gets its own budget from its trailing-text length.
         let opts0 = reqs[0].2.clone().unwrap_or_default();
-        let mut gen_config = opts0.to_gen_config();
-        // Use max_length from options (set by caller via adaptive_max_length)
-        // Safety cap: 120 frames ≈ 10s max audio — prevents runaway generation
-        gen_config.max_new_tokens = gen_config.max_new_tokens.min(120);
+        let gen_config = opts0.to_gen_config();
 
         // Phase 1: Build prefill embeddings (with voice clone support)
         let role_prefix = self.talker.build_role_prefix_pub()?;
@@ -1760,11 +1764,26 @@ impl Qwen3TTS {
         let batched_embed = Tensor::cat(&padded, 0)?;
         let attn_mask = self.build_batched_causal_mask(&masks, max_prefill_len)?;
 
+        // Trailing text length is the injection window, not the speech length.
+        // Budget ~2x a normal rate so the model can finish after the text is in.
+        let mut all_trailing: Vec<Tensor> = Vec::with_capacity(n);
+        let mut all_trailing_len: Vec<usize> = Vec::with_capacity(n);
+        let mut max_frames: Vec<usize> = Vec::with_capacity(n);
+        for ids in &all_input_ids {
+            let trailing = self.build_default_trailing_text(ids)?;
+            let tlen = trailing.dim(1)?;
+            max_frames.push(stream_frame_budget(tlen));
+            all_trailing.push(trailing);
+            all_trailing_len.push(tlen);
+        }
+        let batch_max_frames = max_frames.iter().copied().max().unwrap_or(ICL_MIN_FRAMES);
+
         // Phase 2: Batched prefill
         // Use PreAlloc KV caches to avoid CUDA memory fragmentation from Tensor::cat.
         // Concat caches leak GPU pool memory over many requests with varying lengths.
+        // Size the cache for the longest sequence in this batch, not a shared short cap.
         let num_layers = self.talker.layers_iter().count();
-        let max_seq = bucket32(max_prefill_len + gen_config.max_new_tokens + 16);
+        let max_seq = bucket32(max_prefill_len + batch_max_frames + 16);
         let dtype = self.compute_dtype;
         let mut kv_caches: Vec<models::transformer::AnyKVCache> = (0..num_layers)
             .map(|_| {
@@ -1803,21 +1822,16 @@ impl Qwen3TTS {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let mut sampling_ctxs: Vec<generation::SamplingContext> = (0..n)
             .map(|_| generation::SamplingContext::new(None)).collect();
-        let mut all_trailing: Vec<Tensor> = Vec::with_capacity(n);
-        let mut all_trailing_len: Vec<usize> = Vec::with_capacity(n);
-        for ids in &all_input_ids {
-            let trailing = self.build_default_trailing_text(ids)?;
-            let tlen = trailing.dim(1)?;
-            all_trailing.push(trailing);
-            all_trailing_len.push(tlen);
-        }
 
         let mut semantic_tokens: Vec<Tensor> = Vec::with_capacity(n);
         let mut semantic_ids: Vec<u32> = Vec::with_capacity(n);
         for i in 0..n {
             let logits_2d = last_logits[i].squeeze(1)?;
+            // EOS stays blocked until this sequence's text has been injected.
+            let mut seq_config = gen_config.clone();
+            seq_config.min_new_tokens = all_trailing_len[i];
             let logits_2d = self.apply_generation_penalties_gpu(
-                &logits_2d, &penalty_masks[i], &gen_config, 0, Some(&suppression_mask),
+                &logits_2d, &penalty_masks[i], &seq_config, 0, Some(&suppression_mask),
             )?;
             let tok = generation::sample(&logits_2d, &gen_config, &mut sampling_ctxs[i])?;
             let id: u32 = tok.flatten_all()?.to_vec1::<u32>()?[0];
@@ -1842,28 +1856,35 @@ impl Qwen3TTS {
         let mut prev_frames: Vec<Vec<Vec<u32>>> = (0..n).map(|_| Vec::new()).collect();
         let mut prev_tail: Vec<Vec<f32>> = (0..n).map(|_| Vec::new()).collect();
 
-        // Early stopping: detect token repetition (model stuck in loop)
-        let rep_threshold: usize = 6; // stop after 6 consecutive identical tokens
+        // Early stopping: detect token repetition (model stuck in loop).
+        // Half a second of one codec id can be a held sound, so this only
+        // counts after the trailing text has been injected.
+        let rep_threshold: usize = 6;
         let mut rep_counts: Vec<usize> = vec![0; n];
         let mut prev_ids: Vec<u32> = vec![u32::MAX; n];
 
-        // Phase 3: Batched generation with streaming decode
-        for frame_idx in 0..gen_config.max_new_tokens {
+        // Phase 3: Batched generation with streaming decode.
+        // The loop runs to the longest budget. Each sequence stops at its own.
+        for frame_idx in 0..batch_max_frames {
             for i in 0..n {
                 if !done[i] {
                     // EOS detection
                     let is_eos = gen_config.eos_token_id.map_or(false, |eos| semantic_ids[i] == eos);
-                    // Repetition detection
-                    if semantic_ids[i] == prev_ids[i] {
-                        rep_counts[i] += 1;
-                    } else {
-                        rep_counts[i] = 0;
-                        prev_ids[i] = semantic_ids[i];
+                    // Repetition detection, only once this sequence has seen its text.
+                    let text_in = frame_idx >= all_trailing_len[i];
+                    if text_in {
+                        if semantic_ids[i] == prev_ids[i] {
+                            rep_counts[i] += 1;
+                        } else {
+                            rep_counts[i] = 0;
+                            prev_ids[i] = semantic_ids[i];
+                        }
                     }
-                    let is_stuck = rep_counts[i] >= rep_threshold;
+                    let is_stuck = text_in && rep_counts[i] >= rep_threshold;
                     let is_stopped = stop_flags.get(i).map_or(false, |f| f.load(std::sync::atomic::Ordering::Relaxed));
+                    let hit_budget = frame_idx >= max_frames[i];
 
-                    if is_eos || is_stuck || is_stopped {
+                    if is_eos || is_stuck || is_stopped || hit_budget {
                         done[i] = true;
                         // Flush buffered frames immediately (with context)
                         if !frame_buffers[i].is_empty() {
@@ -1944,8 +1965,10 @@ impl Qwen3TTS {
                 if done[i] { continue; }
                 last_hiddens[i] = batched_hidden.i(i..i + 1)?;
                 let logits_i = batched_logits.i(i..i + 1)?.squeeze(1)?;
+                let mut seq_config = gen_config.clone();
+                seq_config.min_new_tokens = all_trailing_len[i];
                 let logits_i = self.apply_generation_penalties_gpu(
-                    &logits_i, &penalty_masks[i], &gen_config, frame_idx + 1, Some(&suppression_mask),
+                    &logits_i, &penalty_masks[i], &seq_config, frame_idx + 1, Some(&suppression_mask),
                 )?;
                 semantic_tokens[i] = generation::sample(&logits_i, &gen_config, &mut sampling_ctxs[i])?;
                 semantic_ids[i] = semantic_tokens[i].flatten_all()?.to_vec1::<u32>()?[0];
@@ -2463,6 +2486,22 @@ const ICL_MIN_FRAMES: usize = 75;
 /// ICL mode: estimated frames per input text token for max-length cap (matching mlx-audio)
 const ICL_FRAMES_PER_TOKEN: usize = 6;
 
+/// Streaming codec-frame ceiling (~43s at 12 Hz). Matches the non-streaming adaptive cap.
+pub const STREAM_MAX_FRAMES: usize = 512;
+
+/// Frames allowed for one streaming sequence, from its trailing-text length.
+///
+/// Six frames per text token leaves about twice a normal speaking rate.
+/// The floor covers a short phrase. The ceiling stops a missed EOS.
+fn stream_frame_budget(trailing_text_len: usize) -> usize {
+    (trailing_text_len.max(1) * ICL_FRAMES_PER_TOKEN).clamp(ICL_MIN_FRAMES, STREAM_MAX_FRAMES)
+}
+
+/// True when one streaming generation of this many text tokens would hit [`STREAM_MAX_FRAMES`].
+fn text_exceeds_stream_frame_budget(token_len: usize) -> bool {
+    token_len.max(1) * ICL_FRAMES_PER_TOKEN > STREAM_MAX_FRAMES
+}
+
 /// ICL mode: minimum repetition penalty to prevent degenerate loops (matching mlx-audio)
 const ICL_MIN_REPETITION_PENALTY: f64 = 1.3;
 
@@ -2927,6 +2966,17 @@ pub fn device_info(device: &Device) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_stream_frame_budget_scales_with_text_and_caps() {
+        assert_eq!(stream_frame_budget(1), 75);
+        assert_eq!(stream_frame_budget(20), 120);
+        assert_eq!(stream_frame_budget(85), 510);
+        assert_eq!(stream_frame_budget(86), STREAM_MAX_FRAMES);
+        assert_eq!(stream_frame_budget(200), STREAM_MAX_FRAMES);
+        assert!(!text_exceeds_stream_frame_budget(85));
+        assert!(text_exceeds_stream_frame_budget(86));
+    }
 
     #[test]
     fn test_synthesis_options_default() {

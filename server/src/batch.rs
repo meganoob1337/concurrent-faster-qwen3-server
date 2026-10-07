@@ -61,14 +61,6 @@ pub fn adaptive_max_length(text: &str) -> usize {
     ((word_count * 6) + 50).clamp(100, 512)
 }
 
-/// Tighter adaptive cap for streaming — stops generation earlier to avoid
-/// wasting frames on silence when model misses EOS.
-/// ~4 frames/word matches observed Spanish speech rate at 12Hz.
-pub fn adaptive_max_length_streaming(text: &str) -> usize {
-    let word_count = text.split_whitespace().count();
-    ((word_count * 4) + 30).clamp(40, 120)
-}
-
 /// Build voice clone prompts for a batch, returning failed indices.
 /// Uses cache to avoid re-running speaker encoder for repeated ref_audio.
 pub fn build_voice_clone_prompts(
