@@ -1859,9 +1859,9 @@ impl Qwen3TTS {
         let mut prev_tail: Vec<Vec<f32>> = (0..n).map(|_| Vec::new()).collect();
 
         // Early stopping: detect token repetition (model stuck in loop).
-        // Half a second of one codec id can be a pause, so this only
-        // counts after the speaking-length floor.
-        let rep_threshold: usize = 6;
+        // A short hold is normal speech. About 1.2s of one codec id, and only
+        // after the text has been injected, means the model is sitting on silence.
+        let rep_threshold: usize = 15;
         let mut rep_counts: Vec<usize> = vec![0; n];
         let mut prev_ids: Vec<u32> = vec![u32::MAX; n];
 
@@ -1872,9 +1872,9 @@ impl Qwen3TTS {
                 if !done[i] {
                     // EOS detection
                     let is_eos = gen_config.eos_token_id.map_or(false, |eos| semantic_ids[i] == eos);
-                    // Repetition detection, only once this sequence has had time to speak.
-                    let past_spoken = frame_idx >= eos_floors[i];
-                    if past_spoken {
+                    // Repetition detection, once this sequence's text has been injected.
+                    let text_in = frame_idx >= all_trailing_len[i];
+                    if text_in {
                         if semantic_ids[i] == prev_ids[i] {
                             rep_counts[i] += 1;
                         } else {
@@ -1882,7 +1882,7 @@ impl Qwen3TTS {
                             prev_ids[i] = semantic_ids[i];
                         }
                     }
-                    let is_stuck = past_spoken && rep_counts[i] >= rep_threshold;
+                    let is_stuck = text_in && rep_counts[i] >= rep_threshold;
                     let is_stopped = stop_flags.get(i).map_or(false, |f| f.load(std::sync::atomic::Ordering::Relaxed));
                     let hit_budget = frame_idx >= max_frames[i];
 
@@ -2501,13 +2501,14 @@ fn stream_frame_budget(trailing_text_len: usize) -> usize {
 
 /// Frames to generate before codec EOS is allowed.
 ///
-/// Text is injected one token per frame, but speech takes about four frames
-/// per token. Allowing EOS at the end of injection stops the utterance there.
-/// The hard budget stays higher so the model can finish a slow sentence.
+/// Text is injected one token per frame. Allowing EOS at the end of injection
+/// stops the utterance there. Two frames per token is past that point without
+/// padding the clip with silence. The hard budget stays higher so the model
+/// can finish a slow sentence.
 fn stream_eos_floor(trailing_text_len: usize) -> usize {
     let trailing = trailing_text_len.max(1);
     let budget = stream_frame_budget(trailing);
-    let spoken = trailing * 4;
+    let spoken = trailing * 2;
     if spoken >= budget {
         budget.saturating_sub(24).max(trailing)
     } else {
@@ -2994,9 +2995,9 @@ mod tests {
         assert_eq!(stream_frame_budget(200), STREAM_MAX_FRAMES);
         assert!(!text_exceeds_stream_frame_budget(85));
         assert!(text_exceeds_stream_frame_budget(86));
-        // Four frames per token, still under the six-frame budget.
-        assert_eq!(stream_eos_floor(20), 80);
-        assert_eq!(stream_eos_floor(85), 340);
+        // Two frames per token, still under the six-frame budget.
+        assert_eq!(stream_eos_floor(20), 40);
+        assert_eq!(stream_eos_floor(85), 170);
         assert!(stream_eos_floor(200) < STREAM_MAX_FRAMES);
     }
 
