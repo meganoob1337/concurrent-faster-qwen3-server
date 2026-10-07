@@ -11,6 +11,7 @@ High-performance Rust TTS server for Qwen3-TTS-12Hz-0.6B-Base. Batched inference
 - OOM recovery: automatic batch splitting on GPU memory exhaustion
 - Prometheus metrics: `/metrics` endpoint for monitoring
 - Low VRAM: 2.7GB idle, ~4GB during inference
+- Optional second GPU: `AUX_GPU` keeps the talker on one card and the vocoder plus encoders on the other
 
 ## Supported Models
 
@@ -129,7 +130,7 @@ Synthesize speech from text. Supports standard synthesis, voice cloning, and str
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `text` | string | yes | — | Text to synthesize |
-| `language` | string | no | `"spanish"` | Language: `spanish`/`es`, `english`/`en`, `french`/`fr`, `chinese`/`zh`, `japanese`/`ja`, `korean`/`ko` |
+| `language` | string | no | `"spanish"` | `spanish`/`es`, `english`/`en`, `french`/`fr`, `german`/`de`, `italian`/`it`, `portuguese`/`pt`, `russian`/`ru`, `chinese`/`zh`, `japanese`/`ja`, `korean`/`ko` |
 | `temperature` | float | no | `0.7` | Sampling temperature (0.0-1.0) |
 | `stream` | bool | no | `false` | Enable chunked streaming response |
 | `ref_audio` | string | no | — | Base64-encoded WAV for voice cloning |
@@ -233,6 +234,27 @@ tts_queue_depth 3
 | `STREAM_WAIT_MS` | `50` | Wait window to collect streaming batch (ms) |
 | `STREAM_CHUNK_FRAMES` | `6` | Frames per streaming chunk (~500ms audio) |
 | `MAX_REF_AUDIO_BYTES` | `10485760` | Max ref_audio size (10MB) |
+| `AUX_GPU` | unset | CUDA index for the vocoder, speech tokenizer, and speaker encoder. The talker stays on device 0. The text embedding table stays on CPU. |
+
+### Two GPUs
+
+`AUX_GPU` spreads weight memory across two cards. The per-frame talker loop stays on one GPU. Leave it unset to keep the whole model on CUDA device 0.
+
+| Piece | Where it runs |
+|-------|----------------|
+| Talker, KV cache, code predictor | CUDA device 0 |
+| Text embedding table | CPU. Lookups happen when a request starts, not on every frame |
+| Vocoder, speech tokenizer, speaker encoder | `cuda:$AUX_GPU` |
+
+Both GPUs must be visible to the process. `CUDA_VISIBLE_DEVICES` decides which physical card is device 0. `AUX_GPU` is the other card's index in that list, and it has to be a different device.
+
+```bash
+CUDA_VISIBLE_DEVICES=1,0 AUX_GPU=1 MODEL_DIR=models/0.6b-base ./qwen3-tts-server
+```
+
+That keeps the talker on physical GPU 1 and the vocoder on physical GPU 0. Copies between the cards go through host memory. The tensors that cross (text rows, speaker embeddings, codec codes) are small.
+
+On two RTX 3090s the 0.6B model uses about 1.7 GB on the talker GPU and 2.3 GB on the auxiliary GPU, against about 4 GB when the whole model sits on one card.
 
 ## Voice Cloning
 
