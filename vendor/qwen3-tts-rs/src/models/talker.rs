@@ -90,6 +90,38 @@ impl FromStr for Language {
 }
 
 impl Language {
+    /// Canonical name used by the HTTP API. Speakers are not bound to a language.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Language::Chinese => "chinese",
+            Language::English => "english",
+            Language::Japanese => "japanese",
+            Language::Korean => "korean",
+            Language::German => "german",
+            Language::French => "french",
+            Language::Russian => "russian",
+            Language::Portuguese => "portuguese",
+            Language::Spanish => "spanish",
+            Language::Italian => "italian",
+        }
+    }
+
+    /// Every language the codec prefix accepts. Any speaker can use any of these.
+    pub fn all() -> &'static [Language] {
+        &[
+            Language::Chinese,
+            Language::English,
+            Language::Japanese,
+            Language::Korean,
+            Language::German,
+            Language::French,
+            Language::Russian,
+            Language::Portuguese,
+            Language::Spanish,
+            Language::Italian,
+        ]
+    }
+
     /// Get the codec language token ID
     pub fn token_id(&self) -> u32 {
         match self {
@@ -141,6 +173,39 @@ impl FromStr for Speaker {
 }
 
 impl Speaker {
+    /// Canonical name used by the HTTP API (`uncle_fu`, `ono_anna`, …).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Speaker::Serena => "serena",
+            Speaker::Vivian => "vivian",
+            Speaker::UncleFu => "uncle_fu",
+            Speaker::Ryan => "ryan",
+            Speaker::Aiden => "aiden",
+            Speaker::OnoAnna => "ono_anna",
+            Speaker::Sohee => "sohee",
+            Speaker::Eric => "eric",
+            Speaker::Dylan => "dylan",
+        }
+    }
+
+    /// Preset speakers shipped with CustomVoice checkpoints.
+    ///
+    /// These are not tied to a language. The request language selects the
+    /// language token independently of which speaker is used.
+    pub fn all() -> &'static [Speaker] {
+        &[
+            Speaker::Serena,
+            Speaker::Vivian,
+            Speaker::UncleFu,
+            Speaker::Dylan,
+            Speaker::Eric,
+            Speaker::Ryan,
+            Speaker::Aiden,
+            Speaker::OnoAnna,
+            Speaker::Sohee,
+        ]
+    }
+
     /// Get the speaker token ID
     pub fn token_id(&self) -> u32 {
         match self {

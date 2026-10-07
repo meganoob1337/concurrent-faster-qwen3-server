@@ -1282,16 +1282,19 @@ impl Qwen3TTS {
         requests: &[(String, Language, Option<SynthesisOptions>)],
     ) -> Result<Vec<AudioBuffer>> {
         let prompts: Vec<Option<&VoiceClonePrompt>> = vec![None; requests.len()];
-        self.synthesize_batch_with_voices(requests, &prompts)
+        let speakers = vec![Speaker::Serena; requests.len()];
+        self.synthesize_batch_with_voices(requests, &prompts, &speakers)
     }
 
     /// Batched synthesis with optional per-request voice clone prompts.
-    /// When `voice_prompts[i]` is `Some`, uses that speaker embedding;
-    /// when `None`, uses the default Serena voice.
+    /// When `voice_prompts[i]` is `Some`, uses that speaker embedding.
+    /// When `None`, uses `speakers[i]` (Serena when the slice is short).
+    /// Preset speakers are not tied to a language; `requests[i].1` selects it.
     pub fn synthesize_batch_with_voices(
         &self,
         requests: &[(String, Language, Option<SynthesisOptions>)],
         voice_prompts: &[Option<&VoiceClonePrompt>],
+        speakers: &[Speaker],
     ) -> Result<Vec<AudioBuffer>> {
         if requests.is_empty() {
             return Ok(vec![]);
@@ -1302,7 +1305,8 @@ impl Qwen3TTS {
             if let Some(prompt) = voice_prompts.first().and_then(|p| *p) {
                 return Ok(vec![self.synthesize_voice_clone(text, prompt, *lang, opts.clone())?]);
             }
-            let audio = self.synthesize_with_voice(text, Speaker::Serena, *lang, opts.clone())?;
+            let speaker = speakers.first().copied().unwrap_or(Speaker::Serena);
+            let audio = self.synthesize_with_voice(text, speaker, *lang, opts.clone())?;
             return Ok(vec![audio]);
         }
 
@@ -1356,9 +1360,10 @@ impl Qwen3TTS {
                 let bos = codec_embed.i((.., 6..7, ..))?;
                 (ch, bos)
             } else {
-                // Serena path — only recompute language token
+                // Preset speaker path — language and speaker token are per request
                 let mut ids: Vec<u32> = serena_codec_ids_base.to_vec1()?;
                 ids[2] = lang.token_id();
+                ids[4] = speakers.get(idx).copied().unwrap_or(Speaker::Serena).token_id();
                 let codec_ids = Tensor::new(ids.as_slice(), &self.device)?;
                 let codec_embed = self.talker.codec_embedding_forward(&codec_ids)?.unsqueeze(0)?;
                 let codec_first6 = codec_embed.i((.., ..6, ..))?;
@@ -1668,6 +1673,7 @@ impl Qwen3TTS {
         senders: &[std::sync::mpsc::Sender<AudioBuffer>],
         chunk_frames: usize,
         voice_prompts: &[Option<&VoiceClonePrompt>],
+        speakers: &[Speaker],
         stop_flags: &[&std::sync::atomic::AtomicBool],
     ) -> Result<()> {
         let n = requests.len();
@@ -1711,11 +1717,12 @@ impl Qwen3TTS {
                 let first6 = codec_embed.i((.., ..6, ..))?;
                 (tts_text_embed.add(&first6)?, codec_embed.i((.., 6..7, ..))?)
             } else {
-                // Default Serena path
+                // Preset speaker path. Language is independent of the speaker.
+                let speaker = speakers.get(idx).copied().unwrap_or(Speaker::Serena);
                 let codec_ids = Tensor::new(
                     &[codec_tokens::CODEC_THINK, codec_tokens::CODEC_THINK_BOS,
                       lang.token_id(), codec_tokens::CODEC_THINK_EOS,
-                      Speaker::Serena.token_id(), codec_tokens::CODEC_PAD, codec_tokens::CODEC_BOS],
+                      speaker.token_id(), codec_tokens::CODEC_PAD, codec_tokens::CODEC_BOS],
                     &self.device,
                 )?;
                 let codec_embed = self.talker.codec_embedding_forward(&codec_ids)?.unsqueeze(0)?;

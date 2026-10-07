@@ -49,7 +49,8 @@ fn main() {
         let chunk_frames = 5; // ~400ms audio per chunk
         let no_stop: Vec<std::sync::atomic::AtomicBool> = (0..requests.len()).map(|_| std::sync::atomic::AtomicBool::new(false)).collect();
         let stop_refs: Vec<&std::sync::atomic::AtomicBool> = no_stop.iter().collect();
-        if let Err(e) = model.synthesize_batch_streaming(&requests, &senders, chunk_frames, &vec![None; requests.len()], &stop_refs) {
+        let speakers = vec![qwen3_tts::Speaker::Serena; requests.len()];
+        if let Err(e) = model.synthesize_batch_streaming(&requests, &senders, chunk_frames, &vec![None; requests.len()], &speakers, &stop_refs) {
             println!("Batch stream {n}: FAILED: {e:#}");
             continue;
         }

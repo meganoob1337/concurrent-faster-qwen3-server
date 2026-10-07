@@ -17,6 +17,9 @@ pub struct BatchRequest {
     pub language: Language,
     pub voice_clone: Option<VoiceCloneData>,
     pub cached_prompt: Option<Arc<qwen3_tts::VoiceClonePrompt>>,
+    /// Preset speaker used when this request has no voice-clone prompt.
+    /// CustomVoice models always take this path. Not tied to `language`.
+    pub speaker: Speaker,
     pub options: SynthesisOptions,
     pub reply: oneshot::Sender<Result<BatchResult>>,
 }
@@ -191,8 +194,9 @@ impl BatchEngine {
                 };
                 let prompt_refs: Vec<Option<&qwen3_tts::VoiceClonePrompt>> =
                     prompts.iter().map(|p| p.as_deref()).collect();
+                let speakers: Vec<Speaker> = batch.iter().map(|r| r.speaker).collect();
 
-                match model.synthesize_batch_with_voices(&requests, &prompt_refs) {
+                match model.synthesize_batch_with_voices(&requests, &prompt_refs, &speakers) {
                     Ok(audios) => {
                         let gen_time = t0.elapsed().as_secs_f32();
                         let per_req = gen_time / audios.len() as f32;
@@ -271,12 +275,9 @@ impl BatchEngine {
             }
             model.synthesize_voice_clone(&req.text, &prompt, req.language, Some(opts))
         } else {
-            let default_speaker = std::env::var("DEFAULT_SPEAKER").ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(Speaker::Serena);
             model.synthesize_with_voice(
                 &req.text,
-                default_speaker,
+                req.speaker,
                 req.language,
                 Some(req.options.clone()),
             )
