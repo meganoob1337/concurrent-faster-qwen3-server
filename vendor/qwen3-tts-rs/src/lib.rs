@@ -90,7 +90,7 @@ pub mod models;
 pub mod profiling;
 pub mod tokenizer;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use candle_core::{DType, Device, IndexOp, Tensor};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -174,8 +174,11 @@ pub struct Qwen3TTS {
     speech_encoder: Option<Encoder12Hz>,
     /// Detected model variant (None if loaded without config.json)
     model_type: Option<ModelType>,
-    /// Device to run inference on
+    /// Device for the talker and code predictor (the per-frame loop)
     device: Device,
+    /// Device for the vocoder, speech tokenizer, and speaker encoder.
+    /// Equal to `device` unless an auxiliary GPU was requested.
+    aux_device: Device,
     /// Compute dtype for talker + code predictor (BF16 on CUDA, F32 otherwise)
     compute_dtype: DType,
 }
@@ -198,6 +201,25 @@ impl Qwen3TTS {
         Self::from_pretrained_with_tokenizer(model_id, None, device)
     }
 
+    /// Load the talker on `device` and the vocoder, speech tokenizer, and speaker
+    /// encoder on `aux_device`. The text embedding table stays on CPU.
+    ///
+    /// `aux_device` must be a different device. The per-frame talker loop never
+    /// crosses GPUs; only voice preload and the vocoder do.
+    pub fn from_pretrained_with_aux(
+        model_id: &str,
+        device: Device,
+        aux_device: Device,
+    ) -> Result<Self> {
+        if aux_device.same_device(&device) {
+            anyhow::bail!(
+                "auxiliary device {aux_device:?} is the same as the talker device. \
+                 Expose two GPUs and point AUX_GPU at the other one."
+            );
+        }
+        Self::load_pretrained(model_id, None, device, Some(aux_device))
+    }
+
     /// Load a model with an explicit tokenizer source.
     ///
     /// `tokenizer_id` can be a local directory, a file path, or a HuggingFace
@@ -208,8 +230,27 @@ impl Qwen3TTS {
         tokenizer_id: Option<&str>,
         device: Device,
     ) -> Result<Self> {
+        Self::load_pretrained(model_id, tokenizer_id, device, None)
+    }
+
+    fn load_pretrained(
+        model_id: &str,
+        tokenizer_id: Option<&str>,
+        device: Device,
+        aux_device: Option<Device>,
+    ) -> Result<Self> {
+        let split = aux_device.is_some();
+        let aux_device = aux_device.unwrap_or_else(|| device.clone());
         tracing::info!("Loading Qwen3-TTS from: {}", model_id);
         tracing::info!("Compute dtype: {:?}", compute_dtype_for_device(&device));
+        if split {
+            tracing::info!(
+                talker = ?device,
+                aux = ?aux_device,
+                text_embedding = "cpu",
+                "Splitting vocoder and encoders onto the auxiliary device"
+            );
+        }
 
         // Try to parse config.json for auto-detection
         let config_path = Path::new(model_id).join("config.json");
@@ -243,12 +284,21 @@ impl Qwen3TTS {
                 model_path.display()
             );
         }
-        let weights = Self::load_weights(&model_path, &device)?;
+        // When splitting, load on CPU and copy each tensor straight to the GPU
+        // that will own it. Loading the whole file onto the talker GPU first
+        // would leave those bytes in the CUDA caching allocator.
+        let weights = if split {
+            Self::load_weights_placed(&model_path, &device)?
+        } else {
+            Self::load_weights(&model_path, &device)?
+        };
 
-        // Load speech tokenizer for decoder
+        // Load speech tokenizer for decoder. In split mode this file never
+        // touches the talker GPU: the vocoder and speech encoder both live on aux.
+        let st_device = if split { &aux_device } else { &device };
         let st_path = Path::new(model_id).join("speech_tokenizer/model.safetensors");
         let st_weights = if st_path.exists() {
-            Self::load_weights(&st_path, &device)?
+            Self::load_weights(&st_path, st_device)?
         } else {
             // Fall back to looking in parent dir
             let alt_path = Path::new(model_id)
@@ -256,7 +306,7 @@ impl Qwen3TTS {
                 .map(|p| p.join("speech_tokenizer/model.safetensors"));
             if let Some(p) = alt_path {
                 if p.exists() {
-                    Self::load_weights(&p, &device)?
+                    Self::load_weights(&p, st_device)?
                 } else {
                     anyhow::bail!("Speech tokenizer weights not found");
                 }
@@ -271,6 +321,8 @@ impl Qwen3TTS {
             text_tokenizer,
             parsed_config.as_ref(),
             &device,
+            &aux_device,
+            split,
         )
     }
 
@@ -284,7 +336,15 @@ impl Qwen3TTS {
         text_tokenizer: tokenizer::TextTokenizer,
         device: &Device,
     ) -> Result<Self> {
-        Self::build_from_components(model_weights, decoder_weights, text_tokenizer, None, device)
+        Self::build_from_components(
+            model_weights,
+            decoder_weights,
+            text_tokenizer,
+            None,
+            device,
+            device,
+            false,
+        )
     }
 
     /// Load from downloaded model paths.
@@ -308,7 +368,15 @@ impl Qwen3TTS {
         let weights = Self::load_weights(&paths.model_weights, &device)?;
         let st_weights = Self::load_weights(&paths.decoder_weights, &device)?;
 
-        Self::build_from_components(&weights, &st_weights, text_tokenizer, None, &device)
+        Self::build_from_components(
+            &weights,
+            &st_weights,
+            text_tokenizer,
+            None,
+            &device,
+            &device,
+            false,
+        )
     }
 
     /// Shared builder: assembles all model components from pre-loaded weights.
@@ -321,6 +389,8 @@ impl Qwen3TTS {
         text_tokenizer: tokenizer::TextTokenizer,
         parsed_config: Option<&ParsedModelConfig>,
         device: &Device,
+        aux_device: &Device,
+        text_on_cpu: bool,
     ) -> Result<Self> {
         let compute_dtype = compute_dtype_for_device(device);
 
@@ -330,11 +400,12 @@ impl Qwen3TTS {
         } else {
             Self::detect_talker_config(model_weights)?
         };
-        let talker = TalkerModel::from_weights_with_config_dtype(
+        let talker = TalkerModel::from_weights_placed(
             model_weights,
             talker_config,
             device,
             compute_dtype,
+            text_on_cpu,
         )?;
 
         // Build CodePredictor
@@ -361,10 +432,10 @@ impl Qwen3TTS {
         // Speaker encoder (always F32, only present in Base models)
         let se_config = parsed_config.and_then(|c| c.speaker_encoder_config.clone());
         let speaker_encoder =
-            Self::try_load_speaker_encoder(model_weights, se_config.as_ref(), device)?;
+            Self::try_load_speaker_encoder(model_weights, se_config.as_ref(), aux_device)?;
 
         // Speech encoder for ICL voice cloning
-        let speech_encoder = Self::try_load_speech_encoder(decoder_weights, device)?;
+        let speech_encoder = Self::try_load_speech_encoder(decoder_weights, aux_device)?;
 
         let model_type = parsed_config.map(|c| c.model_type);
 
@@ -377,8 +448,87 @@ impl Qwen3TTS {
             speech_encoder,
             model_type,
             device: device.clone(),
+            aux_device: aux_device.clone(),
             compute_dtype,
         })
+    }
+
+    /// Load model weights on CPU, then copy everything except the text embedding
+    /// and the speaker encoder onto `device`. Those two stay on CPU: the text
+    /// table is indexed from CPU, and the speaker encoder's VarBuilder moves its
+    /// weights onto the auxiliary device as F32 (a single copy, not a leftover
+    /// BF16 allocation on the talker GPU).
+    fn load_weights_placed(path: &Path, device: &Device) -> Result<HashMap<String, Tensor>> {
+        let cpu_weights = Self::load_weights(path, &Device::Cpu)?;
+        let mut placed = HashMap::with_capacity(cpu_weights.len());
+        for (key, tensor) in cpu_weights {
+            let stay_on_cpu = key == "talker.model.text_embedding.weight"
+                || key.starts_with("speaker_encoder.");
+            let tensor = if stay_on_cpu {
+                tensor
+            } else {
+                tensor.to_device(device)?
+            };
+            placed.insert(key, tensor);
+        }
+        Ok(placed)
+    }
+
+    fn same_device(tensor: &Tensor, device: &Device) -> bool {
+        tensor.device().same_device(device)
+    }
+
+    /// Make `device`'s CUDA context current on this thread.
+    ///
+    /// A context is only current on the thread that last bound it. Request handlers
+    /// run on tokio workers, and cuBLAS uses the handle created with Candle's
+    /// context without rebinding. A freshly retained primary context is not that
+    /// handle, so matrix multiplies then fail with CUDA_ERROR_INVALID_CONTEXT.
+    /// Bind the stream context Candle already owns. This is a no-op when it is
+    /// already current.
+    fn bind_device(&self, device: &Device) -> Result<()> {
+        #[cfg(feature = "cuda")]
+        {
+            if let Device::Cuda(cuda) = device {
+                cuda.cuda_stream().context().bind_to_thread().map_err(|err| {
+                    anyhow::anyhow!("failed to bind CUDA context: {err}")
+                })?;
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = device;
+        }
+        Ok(())
+    }
+
+    /// Move a tensor to `device`. GPU-to-GPU copies go through host memory:
+    /// candle's direct path (`clone_dtod` on the destination stream) touches the
+    /// source allocation under the destination context and fails with
+    /// CUDA_ERROR_INVALID_CONTEXT. The tensors crossing GPUs here are small
+    /// (codes, audio, speaker embeddings), so the host hop is cheap.
+    fn move_to(tensor: &Tensor, device: &Device) -> Result<Tensor> {
+        if Self::same_device(tensor, device) {
+            return Ok(tensor.clone());
+        }
+        if tensor.device().is_cuda() && device.is_cuda() {
+            let host = tensor.to_device(&Device::Cpu)?;
+            return Ok(host.to_device(device)?);
+        }
+        Ok(tensor.to_device(device)?)
+    }
+
+    fn to_talker(&self, tensor: Tensor) -> Result<Tensor> {
+        self.bind_device(&self.device)?;
+        Self::move_to(&tensor, &self.device)
+    }
+
+    /// Run the vocoder. Codes are built on the talker device; move them only
+    /// when the vocoder lives on the auxiliary GPU.
+    fn decode_on_vocoder(&self, codes: &Tensor) -> Result<Tensor> {
+        self.bind_device(&self.aux_device)?;
+        let codes = Self::move_to(codes, &self.aux_device)?;
+        self.decoder.decode(&codes)
     }
 
     /// Detect talker config from weight shapes (fallback when no config.json).
@@ -553,6 +703,7 @@ impl Qwen3TTS {
         trailing_text_len: usize,
         tts_pad_embed: &Tensor,
     ) -> Result<FrameCodes> {
+        self.bind_device(&self.device)?;
         // Pre-build the token suppression mask once (reused every frame)
         let suppression_mask = generation::build_suppression_mask(
             codec_tokens::CODEC_VOCAB_SIZE,
@@ -899,7 +1050,7 @@ impl Qwen3TTS {
 
     /// Decode a codes tensor `[B, 16, T]` to audio.
     fn decode_tensor(&self, codes: &Tensor) -> Result<AudioBuffer> {
-        let waveform = self.decoder.decode(codes)?;
+        let waveform = self.decode_on_vocoder(codes)?;
         AudioBuffer::from_tensor(waveform, 24000)
     }
 
@@ -931,8 +1082,8 @@ impl Qwen3TTS {
                 }
             }
         }
-        let tensor = Tensor::from_vec(data, (n, 16, max_t), &self.device)?;
-        let waveform = self.decoder.decode(&tensor)?; // [N, 1, samples]
+        let tensor = Tensor::from_vec(data, (n, 16, max_t), &self.aux_device)?;
+        let waveform = self.decode_on_vocoder(&tensor)?; // [N, 1, samples]
 
         let samples_per_frame = 24000 / 12;
         let mut results = Vec::with_capacity(n);
@@ -1145,6 +1296,7 @@ impl Qwen3TTS {
         if requests.is_empty() {
             return Ok(vec![]);
         }
+        self.bind_device(&self.device)?;
         if requests.len() == 1 {
             let (text, lang, opts) = &requests[0];
             if let Some(prompt) = voice_prompts.first().and_then(|p| *p) {
@@ -1456,9 +1608,9 @@ impl Qwen3TTS {
                 }
             }
             let batched_tensor = Tensor::from_vec(
-                batch_data, (non_empty.len(), 16, max_frames), &self.device,
+                batch_data, (non_empty.len(), 16, max_frames), &self.aux_device,
             )?;
-            let waveform = self.decoder.decode(&batched_tensor)?; // [N, 1, total_samples]
+            let waveform = self.decode_on_vocoder(&batched_tensor)?; // [N, 1, total_samples]
             let samples_per_frame = 24000 / 12; // 2000 samples per frame at 24kHz/12Hz
             for (batch_idx, (orig_idx, _)) in non_empty.iter().enumerate() {
                 let actual_samples = frame_lens[batch_idx] * samples_per_frame;
@@ -1984,7 +2136,15 @@ impl Qwen3TTS {
             ref_audio
         };
 
-        let speaker_embedding = encoder.encode(ref_audio)?; // [enc_dim]
+        // Encoders run on the auxiliary GPU. Bind that context on this thread,
+        // then bring the embedding back to the talker before it is cached.
+        self.bind_device(&self.aux_device)?;
+        let speaker_embedding = self.to_talker(
+            encoder
+                .encode(ref_audio)
+                .context("speaker encoder")?,
+        )
+        .context("move speaker embedding to talker")?; // [enc_dim]
 
         // ICL data: encode reference audio to codes and tokenize reference text
         let (ref_codes, ref_text_ids) = if let Some(text) = ref_text {
@@ -1996,7 +2156,10 @@ impl Qwen3TTS {
                 )
             })?;
 
-            let codes = speech_enc.encode(ref_audio)?; // [T_frames, 16]
+            self.bind_device(&self.aux_device)?;
+            let codes = self
+                .to_talker(speech_enc.encode(ref_audio).context("speech encoder")?)
+                .context("move speech codes to talker")?; // [T_frames, 16]
             let text_ids = self.text_tokenizer.encode(text)?;
 
             (Some(codes), Some(text_ids))
@@ -2467,12 +2630,13 @@ impl<'a> StreamingSession<'a> {
     ///
     /// Returns `Some(AudioBuffer)` for each chunk, or `None` when generation is complete.
     pub fn next_chunk(&mut self) -> Result<Option<AudioBuffer>> {
+        self.model.bind_device(&self.model.device)?;
         if self.done {
             // Flush remaining buffer
             if !self.frame_buffer.is_empty() {
                 let codes = self.model.codes_to_tensor(&self.frame_buffer)?;
                 self.frame_buffer.clear();
-                let audio = self.model.decoder.decode(&codes)?;
+                let audio = self.model.decode_on_vocoder(&codes)?;
                 return Ok(Some(AudioBuffer::from_tensor(audio, 24000)?));
             }
             return Ok(None);
@@ -2573,7 +2737,7 @@ impl<'a> StreamingSession<'a> {
 
         let codes = self.model.codes_to_tensor(&self.frame_buffer)?;
         self.frame_buffer.clear();
-        let audio = self.model.decoder.decode(&codes)?;
+        let audio = self.model.decode_on_vocoder(&codes)?;
         Ok(Some(AudioBuffer::from_tensor(audio, 24000)?))
     }
 

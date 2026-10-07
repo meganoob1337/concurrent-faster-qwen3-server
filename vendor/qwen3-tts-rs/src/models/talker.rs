@@ -377,16 +377,42 @@ impl TalkerModel {
         device: &Device,
         dtype: DType,
     ) -> Result<Self> {
+        Self::from_weights_placed(weights, config, device, dtype, false)
+    }
+
+    /// Like [`from_weights_with_config_dtype`](Self::from_weights_with_config_dtype), but when
+    /// `text_on_cpu` is set the text embedding table stays on CPU. Lookups copy only the
+    /// gathered rows to `device` before the text projection.
+    pub fn from_weights_placed(
+        weights: &HashMap<String, Tensor>,
+        config: TalkerConfig,
+        device: &Device,
+        dtype: DType,
+        text_on_cpu: bool,
+    ) -> Result<Self> {
         let vb = VarBuilder::from_tensors(weights.clone(), dtype, device);
         let talker = vb.pp("talker");
         let model = talker.pp("model");
         let layer_config = config.to_layer_config();
 
-        let text_embedding = embedding(
-            config.text_vocab_size,
-            config.text_embed_dim,
-            model.pp("text_embedding"),
-        )?;
+        // Keep this table off the talker GPU. It is ~151936×2048 and is only
+        // indexed at prefill, never inside the decode loop.
+        let text_embedding = if text_on_cpu {
+            // CPU has no bf16 kernels. Keep the table in f32 and cast the
+            // gathered rows back to the talker dtype after the copy.
+            let weight = weights
+                .get("talker.model.text_embedding.weight")
+                .ok_or_else(|| anyhow::anyhow!("Missing talker.model.text_embedding.weight"))?
+                .to_dtype(DType::F32)?
+                .to_device(&Device::Cpu)?;
+            Embedding::new(weight, config.text_embed_dim)
+        } else {
+            embedding(
+                config.text_vocab_size,
+                config.text_embed_dim,
+                model.pp("text_embedding"),
+            )?
+        };
         let text_projection = TextProjection::new(&config, talker.pp("text_projection"))?;
         let codec_embedding = embedding(
             config.codec_vocab_size,
@@ -740,9 +766,7 @@ impl TalkerModel {
     /// Returns a `[1, 3, hidden_size]` tensor used at the start of every prefill variant.
     fn build_role_prefix(&self) -> Result<Tensor> {
         use special_tokens::*;
-        let role_prefix_ids = Tensor::new(&[IM_START, ASSISTANT, NEWLINE], &self.device)?;
-        let role_prefix_embed = self.text_embedding.forward(&role_prefix_ids)?;
-        let role_prefix_embed = role_prefix_embed.unsqueeze(0)?;
+        let role_prefix_embed = self.lookup_text_ids(&[IM_START, ASSISTANT, NEWLINE])?.unsqueeze(0)?;
         self.text_projection.forward(&role_prefix_embed)
     }
 
@@ -752,12 +776,10 @@ impl TalkerModel {
     /// `[tts_pad × pad_count, tts_bos × 1]`.
     fn build_tts_pad_bos(&self, pad_count: usize) -> Result<Tensor> {
         use tts_tokens::*;
-        let tts_pad_id = Tensor::new(&[TTS_PAD], &self.device)?;
-        let tts_pad_embed = self.text_embedding.forward(&tts_pad_id)?.unsqueeze(0)?;
+        let tts_pad_embed = self.lookup_text_ids(&[TTS_PAD])?.unsqueeze(0)?;
         let tts_pad_proj = self.text_projection.forward(&tts_pad_embed)?;
 
-        let tts_bos_id = Tensor::new(&[TTS_BOS], &self.device)?;
-        let tts_bos_embed = self.text_embedding.forward(&tts_bos_id)?.unsqueeze(0)?;
+        let tts_bos_embed = self.lookup_text_ids(&[TTS_BOS])?.unsqueeze(0)?;
         let tts_bos_proj = self.text_projection.forward(&tts_bos_embed)?;
 
         let tts_pad_expanded =
@@ -776,8 +798,7 @@ impl TalkerModel {
         if text_tokens.is_empty() {
             return Ok(None);
         }
-        let first_text_id = Tensor::new(&[text_tokens[0]], &self.device)?;
-        let first_text_embed = self.text_embedding.forward(&first_text_id)?.unsqueeze(0)?;
+        let first_text_embed = self.lookup_text_ids(&[text_tokens[0]])?.unsqueeze(0)?;
         let first_text_proj = self.text_projection.forward(&first_text_embed)?;
         Ok(Some(first_text_proj.add(codec_bos_embed)?))
     }
@@ -788,7 +809,7 @@ impl TalkerModel {
     /// This is a low-level method for reference validation; prefer the
     /// mode-specific prefill methods for actual generation.
     pub fn forward(&self, input_ids: &Tensor) -> Result<Tensor> {
-        let embed = self.text_embedding.forward(input_ids)?;
+        let embed = self.lookup_text_tensor(input_ids)?;
         let projected = self.text_projection.forward(&embed)?;
 
         let seq_len = projected.dim(1)?;
@@ -812,7 +833,7 @@ impl TalkerModel {
         input_ids: &Tensor,
         kv_caches: &mut [AnyKVCache],
     ) -> Result<(Tensor, Tensor)> {
-        let embed = self.text_embedding.forward(input_ids)?;
+        let embed = self.lookup_text_tensor(input_ids)?;
         let projected = self.text_projection.forward(&embed)?;
         self.run_prefill_layers(projected, kv_caches)
     }
@@ -844,9 +865,33 @@ impl TalkerModel {
     ///
     /// Returns a `[1, 1, hidden_size]` tensor.
     fn get_projected_special_embed(&self, token_id: u32) -> Result<Tensor> {
-        let id = Tensor::new(&[token_id], &self.device)?;
-        let embed = self.text_embedding.forward(&id)?.unsqueeze(0)?;
+        let embed = self.lookup_text_ids(&[token_id])?.unsqueeze(0)?;
         self.text_projection.forward(&embed)
+    }
+
+    /// Gather text-embedding rows.
+    ///
+    /// The table may live on CPU. Ids are created on the table's device, and the
+    /// gathered rows are moved to the talker device before any GPU matmul.
+    fn lookup_text_ids(&self, token_ids: &[u32]) -> Result<Tensor> {
+        let ids = Tensor::new(token_ids, self.text_embedding.embeddings().device())?;
+        self.lookup_text_tensor(&ids)
+    }
+
+    fn lookup_text_tensor(&self, ids: &Tensor) -> Result<Tensor> {
+        let embed_device = self.text_embedding.embeddings().device();
+        let ids = if embed_device.same_device(ids.device()) {
+            ids.clone()
+        } else {
+            ids.to_device(embed_device)?
+        };
+        let embeds = self.text_embedding.forward(&ids)?;
+        if self.device.same_device(embeds.device()) {
+            Ok(embeds)
+        } else {
+            let embeds = embeds.to_device(&self.device)?;
+            Ok(embeds.to_dtype(self.codec_head.weight().dtype())?)
+        }
     }
 
     /// Get tts_pad text embedding (projected).
@@ -899,9 +944,7 @@ impl TalkerModel {
             )?);
         }
 
-        let ids_tensor = Tensor::new(token_ids, &self.device)?;
-        let embeds = self.text_embedding.forward(&ids_tensor)?;
-        let embeds = embeds.unsqueeze(0)?; // [1, seq_len, text_embed_dim]
+        let embeds = self.lookup_text_ids(token_ids)?.unsqueeze(0)?; // [1, seq_len, text_embed_dim]
         self.text_projection.forward(&embeds)
     }
 

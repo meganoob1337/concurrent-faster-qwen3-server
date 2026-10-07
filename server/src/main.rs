@@ -151,15 +151,8 @@ struct HealthResponse { status: &'static str, queue_depth: usize, max_batch: usi
 struct ErrorResponse { error: String }
 
 fn parse_language(s: &str) -> Result<Language, String> {
-    match s.to_lowercase().as_str() {
-        "spanish" | "es" => Ok(Language::Spanish),
-        "english" | "en" => Ok(Language::English),
-        "french" | "fr" => Ok(Language::French),
-        "chinese" | "zh" => Ok(Language::Chinese),
-        "japanese" | "ja" => Ok(Language::Japanese),
-        "korean" | "ko" => Ok(Language::Korean),
-        other => Err(format!("unsupported language: {other}")),
-    }
+    // The HTTP layer used to list a subset. The model supports the full set.
+    s.parse().map_err(|err: anyhow::Error| err.to_string())
 }
 
 /// Max text length in characters (configurable via MAX_TEXT_CHARS env var)
@@ -781,8 +774,21 @@ async fn main() -> Result<()> {
     info!(model_dir = %model_dir, max_batch, max_wait_ms, port, "Starting qwen3-tts-server");
 
     let device = qwen3_tts::auto_device()?;
-    info!(?device, "Loading shared model");
-    let model = Arc::new(qwen3_tts::Qwen3TTS::from_pretrained(&model_dir, device)?);
+    let model = if let Ok(aux) = std::env::var("AUX_GPU") {
+        let idx: usize = aux.parse().map_err(|err| {
+            anyhow::anyhow!("AUX_GPU must be a CUDA device index, got {aux:?}: {err}")
+        })?;
+        let aux_device = qwen3_tts::parse_device(&format!("cuda:{idx}"))?;
+        info!(?device, ?aux_device, "Loading model with auxiliary GPU");
+        Arc::new(qwen3_tts::Qwen3TTS::from_pretrained_with_aux(
+            &model_dir,
+            device,
+            aux_device,
+        )?)
+    } else {
+        info!(?device, "Loading shared model");
+        Arc::new(qwen3_tts::Qwen3TTS::from_pretrained(&model_dir, device)?)
+    };
     info!("Shared model loaded");
 
     // Warmup: dummy forward pass through speaker encoder + speech encoder + transformer
@@ -790,12 +796,16 @@ async fn main() -> Result<()> {
     {
         let t0 = std::time::Instant::now();
         let dummy_audio = qwen3_tts::AudioBuffer::new(vec![0.0f32; 24000], 24000); // 1s silence
-        if let Ok(prompt) = model.create_voice_clone_prompt(&dummy_audio, Some("warmup")) {
-            // Run a short synthesis to warm transformer + vocoder
-            let _ = model.synthesize_voice_clone(
-                "warmup", &prompt, qwen3_tts::Language::English,
-                Some(qwen3_tts::SynthesisOptions { max_length: 5, ..Default::default() }),
-            );
+        match model.create_voice_clone_prompt(&dummy_audio, Some("warmup")) {
+            Ok(prompt) => {
+                if let Err(err) = model.synthesize_voice_clone(
+                    "warmup", &prompt, qwen3_tts::Language::English,
+                    Some(qwen3_tts::SynthesisOptions { max_length: 5, ..Default::default() }),
+                ) {
+                    tracing::warn!(%err, "Warmup synthesis failed");
+                }
+            }
+            Err(err) => tracing::warn!(%err, "Warmup voice-clone prompt failed"),
         }
         info!(elapsed_ms = t0.elapsed().as_millis(), "Warmup complete");
     }
